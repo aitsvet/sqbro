@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLite Browser</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: white;
+        }
+        .container {
+            margin: 0 auto;
+            background: white;
+        }
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+        }
+        label {
+            font-weight: bold;
+            margin-bottom: 5px;
+            color: #555;
+        }
+        select, input, button, textarea {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-top: 5px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .where-clause {
+            grid-column: 1 / -1;
+        }
+        .where-clause textarea {
+            width: 100%;
+            height: 60px;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .table-container {
+            margin: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: auto;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+            vertical-align: top;
+            position: relative;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: bold;
+            position: sticky;
+            top: 0;
+            white-space: nowrap;
+        }
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        .error {
+            color: #dc3545;
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 20px;
+        }
+        .info {
+            color: #0c5460;
+            background-color: #d1ecf1;
+            border: 1px solid #bee5eb;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 20px;
+        }
+        .loading {
+            color: #856404;
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 20px;
+        }
+        .record-count {
+            margin: 20px;
+            font-style: italic;
+            color: #666;
+        }
+        td {
+            max-height: 400px;
+            overflow: hidden;
+            line-height: 1.4;
+        }
+        .table-count {
+            font-size: 0.8em;
+            color: #666;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <div class="control-group">
+                <label for="databaseSelect">Database Files:</label>
+                <select id="databaseSelect">
+                    <option value="">Select a database...</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <label for="tableSelect">Tables:</label>
+                <select id="tableSelect" disabled>
+                    <option value="">Select a table...</option>
+                </select>
+            </div>
+            
+            <div class="control-group where-clause">
+                <label for="whereInput">SELECT query suffix:</label>
+                <textarea id="whereInput" placeholder="e.g., WHERE id > 100 AND name LIKE '%john%' LIMIT 10"></textarea>
+            </div>
+        </div>
+
+        <div id="message"></div>
+        
+        <div class="table-container">
+            <table id="recordsTable" style="display: none;">
+                <thead>
+                    <tr id="tableHeader"></tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+            </table>
+        </div>
+        <div id="recordCount" class="record-count"></div>
+    </div>
+
+    <script>
+        let currentDbPath = '';
+        let currentTableName = '';
+        let debounceTimer;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshDatabases();
+            document.getElementById('databaseSelect').addEventListener('change', function() {
+                currentDbPath = this.value;
+                loadTables();
+            });
+            document.getElementById('tableSelect').addEventListener('change', function() {
+                currentTableName = this.value;
+                loadRecords();
+            });
+            document.getElementById('whereInput').addEventListener('input', function() {
+                debouncedLoadRecords();
+            });
+        });
+
+        function showMessage(message, type = 'info') {
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = `<div class="${type}">${message}</div>`;
+        }
+
+        function clearMessage() {
+            document.getElementById('message').innerHTML = '';
+        }
+
+        function showLoading(message = 'Loading...') {
+            showMessage(message, 'loading');
+        }
+
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        function formatMultilineText(text) {
+            if (text === null || text === undefined) return 'NULL';
+            const escaped = escapeHtml(String(text));
+            let result = '';
+            let currentLine = '';
+            const lines = escaped.split('\n');
+            let max_lines = 25;
+            if (lines.length == 1) {
+                const line = lines[0];  
+                if (line.length <= 80) {
+                    result += line;
+                } else {
+                    for (let j = 0; j < line.length && max_lines > 0; j += 80) {
+                        const chunk = line.substring(j, j + 80);
+                        result += chunk;
+                        if (j + 80 < line.length) {
+                            result += '<br>';
+                        }
+                        max_lines--;
+                    }
+                }
+            } else {
+                for (let i = 0; i < lines.length && max_lines > 0; i++) {
+                    const line = lines[i];                    
+                    if (i < lines.length - 1) {
+                        result += line + '<br>';
+                    }
+                    max_lines--;
+                }
+            }
+            
+            return result;
+        }
+
+        async function refreshDatabases() {
+            showLoading('Loading databases...');
+            try {
+                const response = await fetch('/api/databases');
+                const data = await response.json();
+                
+                const select = document.getElementById('databaseSelect');
+                select.innerHTML = '<option value="">Select a database...</option>';
+                
+                data.databases.forEach(db => {
+                    const option = document.createElement('option');
+                    option.value = db;
+                    option.textContent = db;
+                    select.appendChild(option);
+                });
+                
+                clearMessage();
+                if (data.databases.length === 0) {
+                    showMessage('No database files found (.db or .sqlite)', 'info');
+                }
+            } catch (error) {
+                showMessage('Error loading databases: ' + error.message, 'error');
+            }
+        }
+
+        async function loadTables() {
+            const dbPath = document.getElementById('databaseSelect').value;
+            const tableSelect = document.getElementById('tableSelect');
+            
+            tableSelect.disabled = true;
+            tableSelect.innerHTML = '<option value="">Select a table...</option>';
+            document.getElementById('recordsTable').style.display = 'none';
+            document.getElementById('recordCount').innerHTML = '';
+            
+            if (!dbPath) {
+                return;
+            }
+            
+            showLoading('Loading tables...');
+            try {
+                const formData = new FormData();
+                formData.append('db_path', dbPath);
+                
+                const response = await fetch('/api/tables', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                tableSelect.innerHTML = '<option value="">Select a table...</option>';
+                
+                data.tables.forEach(tableInfo => {
+                    const option = document.createElement('option');
+                    option.value = tableInfo.name;
+                    option.textContent = tableInfo.name;
+                    
+                    const countSpan = document.createElement('span');
+                    countSpan.className = 'table-count';
+                    countSpan.textContent = `(${tableInfo.row_count})`;
+                    option.appendChild(countSpan);
+                    
+                    tableSelect.appendChild(option);
+                });
+                
+                tableSelect.disabled = false;
+                clearMessage();
+            } catch (error) {
+                showMessage('Error loading tables: ' + error.message, 'error');
+            }
+        }
+
+        function debouncedLoadRecords() {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(loadRecords, 500);
+        }
+
+        async function loadRecords() {
+            const dbPath = currentDbPath;
+            const tableName = currentTableName;
+            const whereClause = document.getElementById('whereInput').value;
+            
+            if (!dbPath || !tableName) {
+                return;
+            }
+            
+            showLoading('Loading records...');
+            try {
+                const formData = new FormData();
+                formData.append('db_path', dbPath);
+                formData.append('table_name', tableName);
+                formData.append('where_clause', whereClause);
+                
+                const response = await fetch('/api/records', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                displayRecords(data);
+                clearMessage();
+            } catch (error) {
+                showMessage('Error loading records: ' + error.message, 'error');
+                document.getElementById('recordsTable').style.display = 'none';
+                document.getElementById('recordCount').innerHTML = '';
+            }
+        }
+
+        function displayRecords(data) {
+            const table = document.getElementById('recordsTable');
+            const headerRow = document.getElementById('tableHeader');
+            const tableBody = document.getElementById('tableBody');
+            const recordCount = document.getElementById('recordCount');
+            
+            headerRow.innerHTML = '';
+            tableBody.innerHTML = '';
+            recordCount.innerHTML = '';
+            
+            data.columns.forEach(column => {
+                const th = document.createElement('th');
+                th.textContent = column;
+                th.title = column;
+                headerRow.appendChild(th);
+            });
+            
+            data.records.forEach(record => {
+                const tr = document.createElement('tr');
+                record.forEach((value, index) => {
+                    const td = document.createElement('td');
+                    const text = String(value || '');
+                    
+                    td.innerHTML = formatMultilineText(value);
+                    td.title = text;
+                    
+                    const lines = text.split('\n');
+                    const totalLines = lines.reduce((acc, line) => 
+                        acc + Math.ceil(line.length / 80), 0);
+                    
+                    if (totalLines > 50 || text.length > 1000) {
+                        td.classList.add('truncated');
+                    }
+                    
+                    tr.appendChild(td);
+                });
+                tableBody.appendChild(tr);
+            });
+            
+            table.style.display = 'table';
+            recordCount.textContent = `Total records: ${data.count}`;
+        }
+    </script>
+</body>
+</html>
