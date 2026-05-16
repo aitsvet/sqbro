@@ -24,3 +24,7 @@ exclude_dirs = [".venv", "venv"]
 skips = [
     "B104",  # 0.0.0.0 bind is intentional for containerized service
 ]
+
+[tool.pytest.ini_options]
+# /project is bind-mounted read-only in the e2e container; cache must live elsewhere.
+cache_dir = "/tmp/pytest-cache"

@@ -1,0 +1,43 @@
+services:
+  mock-idp:
+    build:
+      context: .
+      dockerfile: tests/mock-idp/Dockerfile
+    networks: [test]
+
+  sqbro:
+    build: .
+    environment:
+      SESSION_SECRET: test-secret-for-e2e-only
+      SESSION_HTTPS_ONLY: "false"
+      OAUTH_CLIENT_ID: test-client
+      OAUTH_SECRET: test-secret
+      OAUTH_AUTH_URL: http://mock-idp:8000/auth
+      OAUTH_TOKEN_URL: http://mock-idp:8000/token
+      OAUTH_PROFILE_URL: http://mock-idp:8000/userinfo
+      OAUTH_REDIRECT_URL: http://sqbro:59620/
+      OAUTH_CALLBACK_URL: http://sqbro:59620/oauth/callback
+      LOG_LEVEL: INFO
+    volumes:
+      - test-data:/data
+    depends_on: [mock-idp]
+    networks: [test]
+
+  tests:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    environment:
+      SQBRO_URL: http://sqbro:59620
+      PROJECT_ROOT: /project
+    volumes:
+      - .:/project:ro
+      - test-data:/data
+    depends_on: [sqbro]
+    networks: [test]
+
+networks:
+  test:
+
+volumes:
+  test-data:
