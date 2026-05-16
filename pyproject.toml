@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "B",         # flake8-bugbear
+    "UP",        # pyupgrade
+    "SIM",       # flake8-simplify
+    "S",         # flake8-bandit (overlaps with bandit but cheap)
+    "RUF",       # ruff-specific
+]
+ignore = [
+    "E501",  # line length handled by formatter
+    "S101",  # asserts are fine in this project (none today)
+    "B008",  # FastAPI uses Form(...) as default — this is the framework idiom
+]
+
+[tool.bandit]
+exclude_dirs = [".venv", "venv"]
+skips = [
+    "B104",  # 0.0.0.0 bind is intentional for containerized service
+]
