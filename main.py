@@ -8,11 +8,22 @@ import os
 import sys
 import secrets
 import base64
+import time
+import logging
 import httpx
 from contextlib import closing
 from urllib.parse import urlencode
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 load_dotenv()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
+log = logging.getLogger("sqbro")
 
 if len(sys.argv) < 2:
     raise SystemExit("Usage: main.py <data-dir>")
@@ -21,6 +32,50 @@ if not os.path.isdir(base):
     raise SystemExit(f"Data directory does not exist: {base}")
 
 app = FastAPI(title="SQLite Browser")
+
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+}
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        user = request.session.get("user_name") if "session" in request.scope else None
+        log.exception(
+            "request_failed method=%s path=%s user=%s duration_ms=%d",
+            request.method, request.url.path, user, duration_ms,
+        )
+        raise
+    duration_ms = int((time.monotonic() - start) * 1000)
+    user = request.session.get("user_name") if "session" in request.scope else None
+    log.info(
+        "request method=%s path=%s status=%d user=%s duration_ms=%d",
+        request.method, request.url.path, status, user, duration_ms,
+    )
+    return response
 
 SECRET_KEY = os.getenv("SESSION_SECRET")
 if not SECRET_KEY:
@@ -50,37 +105,59 @@ if not all([OAUTH_CLIENT_ID, OAUTH_SECRET, OAUTH_AUTH_URL, OAUTH_TOKEN_URL, OAUT
     raise ValueError("Missing required OAuth environment variables")
 
 def require_api_auth(request: Request) -> None:
-    if "access_token" not in request.session:
+    if not request.session.get("authenticated"):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-async def require_auth(request: Request):
-    if "access_token" not in request.session:
-        state = secrets.token_urlsafe(32)
-        request.session["oauth_state"] = state
+OAUTH_STATE_TTL = 600  # seconds; OAuth flow window
+state_signer = URLSafeTimedSerializer(SECRET_KEY, salt="oauth-state")
 
+def make_state() -> str:
+    return state_signer.dumps(secrets.token_urlsafe(16))
+
+def verify_state(state: str) -> bool:
+    try:
+        state_signer.loads(state, max_age=OAUTH_STATE_TTL)
+        return True
+    except (BadSignature, SignatureExpired):
+        return False
+
+async def require_auth(request: Request):
+    if not request.session.get("authenticated"):
         params = {
             "client_id": OAUTH_CLIENT_ID,
             "response_type": "code",
             "scope": OAUTH_SCOPE,
             "redirect_uri": OAUTH_CALLBACK_URL,
-            "state": state
+            "state": make_state()
         }
 
         auth_url = f"{OAUTH_AUTH_URL}?{urlencode(params)}"
+        log.info("oauth_login_start path=%s", request.url.path)
         return RedirectResponse(url=auth_url)
     return None
 
 @app.get("/oauth/callback")
-async def oauth_callback(request: Request, code: str = None, state: str = None, error: str = None):
+async def oauth_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    error_description: str = None,
+):
     if error:
-        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
-    
+        log.warning("oauth_callback_error error=%s description=%s", error, error_description)
+        detail = f"OAuth error: {error}"
+        if error_description:
+            detail += f" — {error_description}"
+        raise HTTPException(status_code=400, detail=detail)
+
     if not code or not state:
+        log.warning("oauth_callback_missing_params has_code=%s has_state=%s", bool(code), bool(state))
         raise HTTPException(status_code=400, detail="Missing code or state parameter")
-    
-    stored_state = request.session.get("oauth_state")
-    if not stored_state or stored_state != state:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    if not verify_state(state):
+        log.warning("oauth_callback_bad_state")
+        raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
 
     credentials = f"{OAUTH_CLIENT_ID}:{OAUTH_SECRET}"
     encoded_credentials = base64.b64encode(credentials.encode()).decode()
@@ -125,16 +202,18 @@ async def oauth_callback(request: Request, code: str = None, state: str = None, 
         profile = profile_response.json()
         user_name = profile.get(OAUTH_PROFILE_NAME_FIELD)
 
-    request.session["access_token"] = access_token
+    request.session["authenticated"] = True
     request.session["user_name"] = user_name
-    request.session.pop("oauth_state", None)
-    
+
+    log.info("oauth_login_success user=%s", user_name)
     return RedirectResponse(url=OAUTH_REDIRECT_URL)
 
-@app.get("/oauth/logout")
+@app.post("/oauth/logout")
 async def oauth_logout(request: Request):
+    user = request.session.get("user_name")
     request.session.clear()
-    return RedirectResponse(url=OAUTH_REDIRECT_URL)
+    log.info("oauth_logout user=%s", user)
+    return RedirectResponse(url=OAUTH_REDIRECT_URL, status_code=303)
 
 MAX_RECORDS = int(os.getenv("MAX_RECORDS", "1000"))
 
@@ -171,16 +250,19 @@ async def get_databases(request: Request):
     try:
         db_files = glob.glob("**/*.db", root_dir=base, recursive=True) + glob.glob("**/*.sqlite", root_dir=base, recursive=True)
         return {"databases": [f for f in db_files if os.path.isfile(os.path.join(base, f))]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("list_databases_failed")
+        raise HTTPException(status_code=500, detail="Internal error")
 
 @app.post("/api/tables")
 async def get_tables(request: Request, db_path: str = Form(...)):
     require_api_auth(request)
-    db_path = resolve_db_path(db_path)
+    resolved = resolve_db_path(db_path)
+    user = request.session.get("user_name")
+    log.info("list_tables user=%s db=%s", user, db_path)
 
     try:
-        with closing(connect_ro(db_path)) as conn:
+        with closing(connect_ro(resolved)) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = [table[0] for table in cursor.fetchall()]
@@ -192,8 +274,9 @@ async def get_tables(request: Request, db_path: str = Form(...)):
             return {"tables": table_info}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("list_tables_failed user=%s db=%s", user, db_path)
+        raise HTTPException(status_code=500, detail="Internal error")
 
 @app.post("/api/records")
 async def get_records(
@@ -206,10 +289,15 @@ async def get_records(
     if not table_name.replace('_', '').isalnum():
         raise HTTPException(status_code=400, detail="Invalid table name")
 
-    db_path = resolve_db_path(db_path)
+    resolved = resolve_db_path(db_path)
+    user = request.session.get("user_name")
+    log.info(
+        "query_records user=%s db=%s table=%s where=%r",
+        user, db_path, table_name, where_clause,
+    )
 
     try:
-        with closing(connect_ro(db_path)) as conn:
+        with closing(connect_ro(resolved)) as conn:
             cursor = conn.cursor()
 
             query = f"SELECT * FROM {quote_ident(table_name)}"
@@ -232,8 +320,12 @@ async def get_records(
             }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except sqlite3.Error as e:
+        log.warning("query_records_sqlite_error user=%s db=%s table=%s error=%s", user, db_path, table_name, e)
+        raise HTTPException(status_code=400, detail=f"SQL error: {e}")
+    except Exception:
+        log.exception("query_records_failed user=%s db=%s table=%s", user, db_path, table_name)
+        raise HTTPException(status_code=500, detail="Internal error")
 
 if __name__ == "__main__":
     import uvicorn
