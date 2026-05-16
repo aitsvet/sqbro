@@ -4,7 +4,6 @@ import logging
 import os
 import secrets
 import sqlite3
-import sys
 import time
 from contextlib import closing
 from urllib.parse import urlencode
@@ -26,9 +25,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("sqbro")
 
-if len(sys.argv) < 2:
-    raise SystemExit("Usage: main.py <data-dir>")
-base = os.path.realpath(sys.argv[1])
+_data_dir = os.getenv("DATA_DIR")
+if not _data_dir:
+    raise SystemExit("DATA_DIR environment variable is required")
+base = os.path.realpath(_data_dir)
 if not os.path.isdir(base):
     raise SystemExit(f"Data directory does not exist: {base}")
 
@@ -261,7 +261,7 @@ async def read_index(request: Request):
     auth_redirect = await require_auth(request)
     if auth_redirect:
         return auth_redirect
-    return FileResponse("index.html")
+    return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
 
 
 @app.get("/api/me")
@@ -314,9 +314,6 @@ async def get_records(
     request: Request, db_path: str = Form(...), table_name: str = Form(...), where_clause: str = Form("")
 ):
     require_api_auth(request)
-    if not table_name.replace("_", "").isalnum():
-        raise HTTPException(status_code=400, detail="Invalid table name")
-
     resolved = resolve_db_path(db_path)
     user = request.session.get("user_name")
     log.info(

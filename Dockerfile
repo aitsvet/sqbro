@@ -9,4 +9,5 @@ RUN python3 -m venv /opt/venv && pip install --no-cache-dir -r requirements.txt
 USER 1000:1000
 
 EXPOSE 59620
-CMD ["python", "main.py", "/data"]
+ENV DATA_DIR=/data
+CMD ["python", "main.py"]
